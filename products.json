@@ -1,0 +1,38 @@
+{
+  "Projector": {
+    "length": 20.0,
+    "breadth": 20.0,
+    "height": 7.0,
+    "weight": 2.0
+  },
+  "Vlogcamera": {
+    "length": 15.0,
+    "breadth": 15.0,
+    "height": 7.0,
+    "weight": 2.0
+  },
+  "7IN 1 combo airpods and mini speaker": {
+    "length": 15.0,
+    "breadth": 15.0,
+    "height": 7.0,
+    "weight": 2.0
+  },
+  "7 in 1 combo": {
+    "length": 15.0,
+    "breadth": 15.0,
+    "height": 5.0,
+    "weight": 2.0
+  },
+  "Game stick 15": {
+    "length": 0.5,
+    "breadth": 0.5,
+    "height": 5.0,
+    "weight": 0.5
+  },
+  "Rc car": {
+    "length": 20.0,
+    "breadth": 15.0,
+    "height": 7.0,
+    "weight": 2.0
+  }
+}
