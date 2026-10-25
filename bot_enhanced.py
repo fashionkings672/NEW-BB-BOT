@@ -754,6 +754,9 @@ def refresh_duplicate_history():
             raise RuntimeError("Cannot verify complete Shiprocket history")
         reached_known = False
         for row in rows:
+            if page == 1 and not pending:
+                log.info("History row schema: %s", {k: (list(v) if isinstance(v, dict) else type(v).__name__) for k, v in row.items()})
+                log.info("History phone shapes: %s", {k: {"type": type(v).__name__, "digits": len(re.sub(r"\D", "", str(v))), "masked": "*" in str(v)} for k, v in row.items() if "phone" in k.lower() or "mobile" in k.lower()})
             row_id = int(row["id"])
             if previous_id is not None and row_id > previous_id:
                 raise RuntimeError("Unexpected Shiprocket history sort order")
