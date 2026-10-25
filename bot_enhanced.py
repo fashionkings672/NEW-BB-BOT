@@ -754,9 +754,6 @@ def refresh_duplicate_history():
             raise RuntimeError("Cannot verify complete Shiprocket history")
         reached_known = False
         for row in rows:
-            if page == 1 and not pending:
-                log.info("History row schema: %s", {k: (list(v) if isinstance(v, dict) else type(v).__name__) for k, v in row.items()})
-                log.info("History phone shapes: %s", {k: {"type": type(v).__name__, "digits": len(re.sub(r"\D", "", str(v))), "masked": "*" in str(v)} for k, v in row.items() if "phone" in k.lower() or "mobile" in k.lower()})
             row_id = int(row["id"])
             if previous_id is not None and row_id > previous_id:
                 raise RuntimeError("Unexpected Shiprocket history sort order")
@@ -765,8 +762,15 @@ def refresh_duplicate_history():
                 reached_known = True
                 break
             shipment = next(iter(row.get("shipments") or []), {})
-            primary = row.get("customer_phone") or row.get("billing_phone") or row.get("shipping_phone") or row.get("phone") or ""
-            alternate = row.get("customer_alternate_phone") or row.get("alternate_phone") or row.get("alt_phone") or ""
+            original = row.get("others") or {}
+            if not isinstance(original, dict):
+                original = {}
+            primary = next((clean_phone(v) for v in (
+                row.get("customer_phone"), row.get("billing_phone"), row.get("shipping_phone"), row.get("phone"),
+                original.get("billing_phone_number"), original.get("billing_phone")) if clean_phone(v)), "")
+            alternate = next((clean_phone(v) for v in (
+                row.get("customer_alternate_phone"), row.get("alternate_phone"), row.get("alt_phone"),
+                original.get("billing_alternate_phone")) if clean_phone(v)), "")
             pending[row_id] = {
                 "order_number": row.get("channel_order_id") or row_id,
                 "phone": primary, "alt_phone": alternate,
