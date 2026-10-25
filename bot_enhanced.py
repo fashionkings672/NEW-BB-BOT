@@ -2,7 +2,7 @@
 bot_enhanced.py — Oneboxx Ship Bot Final
 Features:
 - Gemini address parsing with missing-field follow-up
-- Explicit COD/Prepaid review and strict duplicate blocking
+- Explicit COD/Prepaid review and duplicate warning and repeat-order confirmation
 - Orders saved to Google Sheets; Meta uploads disabled
 
 FIX: sr_payment NameError — variable now passed through _finish_shipment_after_awb
@@ -745,9 +745,25 @@ def duplicate_order(d):
             return order
     return None
 
+def duplicate_key(order):
+    return str(order.get("order_id") or order.get("order_number") or (order.get("shiprocket") or {}).get("order_id") or order)
+
+async def show_duplicate_warning(reply, ctx, existing):
+    d = ctx.user_data["create_parsed"]
+    d["cod"] = str(order_amount(d["amount"]))
+    ctx.user_data.update(state="duplicate_confirm", duplicate_pending=duplicate_key(existing),
+                         confirm_nonce=uuid.uuid4().hex[:12], create_creative="")
+    nonce = ctx.user_data["confirm_nonce"]
+    old_cod = existing.get("cod_amount", existing.get("total", "unknown"))
+    text = (f"Duplicate found: order #{existing.get('order_number', 'pending')}\n"
+            f"Existing COD amount: ₹{old_cod}\n\n" + order_preview(d) +
+            "\n\nDo you want to create a new order?")
+    await reply.reply_text(text, reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardButton("Create new order", callback_data="dup_create_" + nonce),
+        InlineKeyboardButton("Cancel", callback_data="cancel_draft_" + nonce)]]))
+
 def booking_reference(d):
-    # The same customer always has the same remote ID, even after restart/timeouts.
-    return str(int(hashlib.sha256(("BB-SHIP-" + clean_phone(d["phone"])).encode()).hexdigest()[:30], 16))
+    return d.setdefault("booking_reference", str(uuid.uuid4().int))
 
 def order_preview(d):
     amount = order_amount(d.get("amount", "")) or Decimal(0)
@@ -783,10 +799,7 @@ async def continue_order(reply, ctx):
         await reply.reply_text("History sync is temporarily unavailable. Checking saved orders for duplicates.")
     existing = duplicate_order(d)
     if existing:
-        await reply.reply_text(f"Duplicate blocked. Existing order #{existing.get('order_number', 'pending')}\n"
-                               f"AWB: {(existing.get('shiprocket') or {}).get('awb') or 'pending'}\n"
-                               "This phone/alternate phone or customer address already has an order. No new shipment booked.")
-        ctx.user_data.clear()
+        await show_duplicate_warning(reply, ctx, existing)
         return
     d["cod"] = str(order_amount(d["amount"]))
     ctx.user_data["create_creative"] = ""
@@ -829,9 +842,9 @@ async def do_create_shipment(update_or_q, ctx):
             await asyncio.to_thread(refresh_duplicate_history)
         except Exception:
             log.warning("Final history refresh unavailable; checking saved local orders")
-        if duplicate_order(d):
-            await reply.reply_text("Duplicate blocked at final booking check. No shipment booked.")
-            ctx.user_data.clear()
+        existing = duplicate_order(d)
+        if existing and ctx.user_data.get("duplicate_approved") != duplicate_key(existing):
+            await show_duplicate_warning(reply, ctx, existing)
             return
         await _do_create_shipment(update_or_q, ctx)
 
@@ -1355,6 +1368,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     ud = ctx.user_data
 
+    if data.startswith("dup_create_"):
+        if ud.get("state") != "duplicate_confirm" or data != "dup_create_" + ud.get("confirm_nonce", ""):
+            await q.message.reply_text("This confirmation has expired. Start a new draft."); return
+        ud["duplicate_approved"] = ud.get("duplicate_pending")
+        ud["state"] = "booking"
+        await q.edit_message_reply_markup(reply_markup=None)
+        await do_create_shipment(update, ctx); return
+
     if data.startswith("book_"):
         if ud.get("state") != "create_confirm" or data != "book_" + ud.get("confirm_nonce", ""):
             await q.message.reply_text("This booking button has expired. Start a new draft."); return
@@ -1370,7 +1391,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data in ("dup_yes", "dup_no"):
-        await q.message.reply_text("Duplicate override is disabled. Existing orders cannot be booked again.")
+        await q.message.reply_text("This old confirmation has expired. Please send the order again.")
         ud.clear(); return
 
     if data.startswith("adv_start_"):
