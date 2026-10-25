@@ -729,10 +729,65 @@ def missing_order_field(d):
         return "amount", "Please send the " + label + " (number only)."
     return None, None
 
+_sr_history = {}
+_sr_history_ready = False
+
+def refresh_duplicate_history():
+    """Read durable Sheets and authoritative Shiprocket history; fail closed."""
+    global _sr_history_ready
+    sync_from_sheets(strict=True)
+    ensure_token()
+    high_water = max(_sr_history, default=0) if _sr_history_ready else 0
+    pending = {}
+    page = 1
+    previous_id = None
+    while True:
+        response = session.get(f"{SR_BASE}/orders", params={
+            "page": page, "per_page": 100, "sort_by": "id", "sort": "DESC",
+            "from": "2000-01-01", "to": date.today().isoformat()}, timeout=30)
+        response.raise_for_status()
+        body = response.json()
+        rows = body.get("data")
+        pagination = body.get("meta", {}).get("pagination", {})
+        if not isinstance(rows, list) or "total_pages" not in pagination:
+            raise RuntimeError("Cannot verify complete Shiprocket history")
+        reached_known = False
+        for row in rows:
+            row_id = int(row["id"])
+            if previous_id is not None and row_id > previous_id:
+                raise RuntimeError("Unexpected Shiprocket history sort order")
+            previous_id = row_id
+            if high_water and row_id <= high_water:
+                reached_known = True
+                break
+            shipment = next(iter(row.get("shipments") or []), {})
+            primary = row.get("customer_phone") or row.get("billing_phone") or row.get("shipping_phone") or row.get("phone") or ""
+            alternate = row.get("customer_alternate_phone") or row.get("alternate_phone") or row.get("alt_phone") or ""
+            pending[row_id] = {
+                "order_number": row.get("channel_order_id") or row_id,
+                "phone": primary, "alt_phone": alternate,
+                "customer_name": row.get("customer_name") or row.get("billing_customer_name") or "",
+                "address": row.get("customer_address") or "",
+                "pincode": str(row.get("customer_pincode") or ""),
+                "shiprocket": {"order_id": row_id, "awb": shipment.get("awb") or ""}}
+        pages = int(pagination["total_pages"])
+        if reached_known or page >= pages:
+            break
+        if not rows or page >= 1000:
+            raise RuntimeError("Shiprocket history pagination incomplete")
+        page += 1
+    _sr_history.update(pending)
+    _sr_history_ready = True
+    indexed_phones = sum(bool(clean_phone(o.get("phone", ""))) for o in _sr_history.values())
+    if _sr_history and not indexed_phones:
+        raise RuntimeError("Shiprocket history contains no readable phone numbers")
+    log.info("Duplicate history verified: remote_orders=%s readable_phones=%s new_orders=%s pages=%s",
+             len(_sr_history), indexed_phones, len(pending), page)
+
 def duplicate_order(d):
     phones = {clean_phone(d.get("phone", "")), clean_phone(d.get("alt_phone", ""))} - {""}
     def norm(value): return re.sub(r"\W", "", str(value).casefold())
-    for order in reversed(load_orders()):
+    for order in list(reversed(load_orders())) + list(_sr_history.values()):
         existing = {clean_phone(order.get("phone", "")), clean_phone(order.get("alt_phone", ""))} - {""}
         same_address = (norm(d.get("name")) == norm(order.get("customer_name"))
                         and norm(d.get("address")) and norm(d.get("address")) == norm(order.get("address"))
@@ -773,7 +828,7 @@ async def continue_order(reply, ctx):
     d["pickup"] = pickup["pickup_location"]
     # Refresh durable history. Never book if the duplicate check cannot be completed.
     try:
-        await asyncio.to_thread(sync_from_sheets, strict=True)
+        await asyncio.to_thread(refresh_duplicate_history)
     except Exception:
         ctx.user_data["state"] = "create_history_retry"
         await reply.reply_text("Cannot verify order history right now. No shipment booked. Send retry to check again, or /start to cancel.")
@@ -823,7 +878,7 @@ async def do_create_shipment(update_or_q, ctx):
             await continue_order(reply, ctx)
             return
         try:
-            await asyncio.to_thread(sync_from_sheets, strict=True)
+            await asyncio.to_thread(refresh_duplicate_history)
         except Exception:
             ctx.user_data["state"] = "create_history_retry"
             await reply.reply_text("Order history unavailable. Nothing booked. Send retry or /start.")
@@ -1500,6 +1555,10 @@ async def main():
     log.info("Syncing from sheets...")
     sync_from_sheets()
     log.info("Sync done")
+    try:
+        await asyncio.to_thread(refresh_duplicate_history)
+    except Exception:
+        log.error("Duplicate history unavailable; booking will remain blocked until verification succeeds")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
