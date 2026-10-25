@@ -750,7 +750,7 @@ def refresh_duplicate_history():
         rows = body.get("data")
         pagination = body.get("meta", {}).get("pagination", {})
         if not isinstance(rows, list) or "total_pages" not in pagination:
-            log.warning("History schema keys=%s data_type=%s meta=%s", list(body), type(rows).__name__, body.get("meta"))
+            log.warning("History schema keys=%s data_type=%s meta=%s message=%s", list(body), type(rows).__name__, body.get("meta"), str(body.get("message", ""))[:300])
             raise RuntimeError("Cannot verify complete Shiprocket history")
         reached_known = False
         for row in rows:
@@ -770,7 +770,8 @@ def refresh_duplicate_history():
                 "customer_name": row.get("customer_name") or row.get("billing_customer_name") or "",
                 "address": row.get("customer_address") or "",
                 "pincode": str(row.get("customer_pincode") or ""),
-                "shiprocket": {"order_id": row_id, "awb": shipment.get("awb") or ""}}
+                "shiprocket": {"order_id": row_id, "shipment_id": shipment.get("id") or shipment.get("shipment_id"),
+                               "awb": shipment.get("awb") or ""}}
         pages = int(pagination["total_pages"])
         if reached_known or page >= pages:
             break
@@ -779,6 +780,21 @@ def refresh_duplicate_history():
         page += 1
     _sr_history.update(pending)
     _sr_history_ready = True
+    # Recover remote shipment IDs for label download after a container restart.
+    by_awb = {str(o["shiprocket"]["awb"]): o for o in _sr_history.values() if o["shiprocket"].get("awb")}
+    local_orders = load_orders()
+    restored = False
+    for order in local_orders:
+        shipment = order.get("shiprocket") or {}
+        remote = by_awb.get(str(shipment.get("awb", "")))
+        if remote and remote["shiprocket"].get("shipment_id"):
+            for key in ("order_id", "shipment_id"):
+                if shipment.get(key) != remote["shiprocket"][key]:
+                    shipment[key] = remote["shiprocket"][key]
+                    restored = True
+            order["shiprocket"] = shipment
+    if restored:
+        save_orders(local_orders)
     indexed_phones = sum(bool(clean_phone(o.get("phone", ""))) for o in _sr_history.values())
     if _sr_history and not indexed_phones:
         raise RuntimeError("Shiprocket history contains no readable phone numbers")
