@@ -1060,22 +1060,18 @@ async def _finish_shipment_after_awb(reply, ctx, awb, chosen,
 
     save_order(order_record)
 
-    # ← FIX: escape courier_label before placing it into a parse_mode="Markdown" message
-    courier_label = escape_markdown(chosen.get("courier_name",""), version=1)
+    # Schedule pickup once the AWB exists; label delivery must work even on failure.
+    pickup_ok, pickup_error = await asyncio.to_thread(schedule_pickup, [shipment_id])
+    try:
+        update_order_by_id(order_id, pickup_scheduled=pickup_ok)
+    except Exception:
+        log.warning("Could not save pickup status for order %s", order_id)
+    if not pickup_ok:
+        log.warning("Automatic pickup failed for shipment %s: %s", shipment_id, pickup_error)
+    collect = 0 if sr_payment == "Prepaid" else cod_amount
+    pickup_text = "Pickup scheduled" if pickup_ok else "Pickup pending"
     await reply.reply_text(
-        f"✅ *Shipment Created!*\n"
-        f"Order: #{order_num} | {d.get('name','')} | {d.get('phone','')}\n"
-        f"Address: {d.get('address','')}\n"
-        f"Landmark: {d.get('address2','—')}\n"
-        f"City: {d.get('city','')}, {delivery_pin}\n"
-        f"State: {d.get('state','Karnataka')}\n"
-        f"Product: {prod_name}\n"
-        f"Order value: ₹{cod_amount:,.2f} | Collect on delivery: ₹{0 if sr_payment == 'Prepaid' else cod_amount:,.2f}\n"
-        f"Payment: {sr_payment}\n"
-        f"Vendor: {pickup_display} | {courier_label}\n"
-        f"AWB: `{awb}`\n"
-        f"Tracking: {tracking}",
-        parse_mode="Markdown")
+        f"✅ Shipment booked\nProduct: {prod_name}\nCOD: ₹{collect:,.2f}\n{pickup_text}")
 
     label_sent = False
     label_url = generate_label(shipment_id)
@@ -1086,21 +1082,19 @@ async def _finish_shipment_after_awb(reply, ctx, awb, chosen,
                     if r2.status == 200:
                         await reply.reply_document(
                             document=await r2.read(),
-                            filename=f"{awb}.pdf",
-                            caption=f"📄 {d.get('name','')} | {awb}")
+                            filename="Shipping_label.pdf",
+                            caption="📄 Shipping label")
                         label_sent = True
         except Exception as e:
             log.error(f"Label: {e}")
 
     if not label_sent:
-        await reply.reply_text(f"Shipment is booked: AWB {awb}. Label download is pending; use Download Labels. Do not create the order again.")
+        await reply.reply_text("Shipment booked. Label pending; use Download Labels. Do not book again.")
 
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Schedule Pickup", callback_data=f"pickup_yes_{shipment_id}_{order_id}"),
-        InlineKeyboardButton("🔄 Reassign", callback_data=f"action_reassign_{order_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"action_cancel_{order_id}"),
-    ]])
-    await reply.reply_text("Shipment action:", reply_markup=kb)
+    if not pickup_ok:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Retry pickup", callback_data=f"pickup_yes_{shipment_id}_{order_id}")]])
+        await reply.reply_text("Pickup could not be scheduled. Retry pickup only; the shipment is already booked.", reply_markup=kb)
     ctx.user_data.clear()
 
 # ─── SEARCH ───────────────────────────────
