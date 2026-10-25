@@ -10,6 +10,7 @@ import os
 import re
 import json
 import logging
+import tempfile
 from datetime import datetime, date, timedelta
 
 log = logging.getLogger("orders_manager")
@@ -29,8 +30,11 @@ def load_orders():
         return []
 
 def save_orders(orders):
-    with open(ORDERS_FILE, "w") as f:
+    directory = os.path.dirname(os.path.abspath(ORDERS_FILE))
+    with tempfile.NamedTemporaryFile("w", dir=directory, delete=False) as f:
         json.dump(orders, f, indent=2, default=str)
+        temporary = f.name
+    os.replace(temporary, ORDERS_FILE)
 
 def next_order_number():
     data = {}
@@ -54,13 +58,20 @@ def next_order_number():
 
 def save_order(order):
     orders = load_orders()
-    orders.append(order)
+    existing = next((o for o in orders if o.get("order_id") == order.get("order_id")), None)
+    if existing is not None:
+        existing.update(order)
+        order = existing
+    else:
+        orders.append(order)
     save_orders(orders)
     _sync_to_sheets(order)
 
 def _norm_phone(phone):
     """Normalize phone — remove +91, spaces, .0 from float, keep last 10 digits."""
-    p = re.sub(r"[^\d]","", str(phone).strip())
+    value = str(phone).strip()
+    if value.endswith(".0"): value = value[:-2]
+    p = re.sub(r"[^\d]", "", value)
     if p.startswith("91") and len(p) == 12:
         p = p[2:]
     return p[-10:] if len(p) >= 10 else p
@@ -102,11 +113,15 @@ def update_order_by_id(order_id, **fields):
 # ─── PAYMENT ──────────────────────────────
 
 def calc_cod(order, courier_paid, advance_paid):
+    if str(order.get("payment_method", "")).upper() == "PREPAID":
+        return 0
     """Use order total — not hardcoded 3300."""
     total = order.get("total", 3300)
     return int(total) - int(courier_paid or 0) - int(advance_paid or 0)
 
 def payment_status(order):
+    if str(order.get("payment_method", "")).upper() == "PREPAID":
+        return "prepaid"
     c = order.get("courier_paid") or 0
     a = order.get("advance_paid")
     if a is None and c > 0:
@@ -401,16 +416,19 @@ def _order_to_row(o):
         o.get("status","active"),
         o.get("pickup_location",""),
         o.get("label_downloaded_date",""),
+        o.get("payment_method", ""), o.get("alt_phone", ""), o.get("address", ""),
+        o.get("address2", ""), o.get("order_id", ""),
     ]
 
 SHEET_HEADERS = [
     "Order#","Date","Name","Phone","City","State","Pincode",
     "Product","Creative","Total","Courier Paid","Advance",
     "COD","Payment Status","Vendor","Courier","AWB",
-    "Tracking","Status","Pickup","Label Downloaded"
+    "Tracking","Status","Pickup","Label Downloaded",
+    "Payment Method","Alt Phone","Address","Landmark","Bot Order ID"
 ]
 
-def sync_from_sheets():
+def sync_from_sheets(strict=False):
     """
     On startup — import all rows from Google Sheet → orders.json
     Skips rows that already exist by order_number.
@@ -420,12 +438,14 @@ def sync_from_sheets():
         sid = os.getenv("GOOGLE_SHEET_ID")
         if not gc or not sid:
             log.warning("sync_from_sheets: no credentials or sheet ID")
+            if strict: raise RuntimeError("Order history not configured")
             return
         sh = gc.open_by_key(sid)
         try:
             ws = sh.worksheet("Orders")
         except Exception:
             log.warning("sync_from_sheets: Orders sheet not found")
+            if strict: raise RuntimeError("Order history unavailable")
             return
 
         rows = ws.get_all_records()  # list of dicts keyed by header
@@ -477,12 +497,15 @@ def sync_from_sheets():
             clean_phone = raw_phone[-10:] if len(raw_phone) >= 10 else raw_phone
 
             order = {
-                "order_id":        f"SHEET_{num}",
+                "order_id":        str(row.get("Bot Order ID", "") or f"SHEET_{num}"),
                 "order_number":    order_num,
                 "created_at":      str(row.get("Date","")).replace(" ","T"),
                 "phone":           clean_phone,
                 "customer_name":   str(row.get("Name","")).strip(),
-                "address":         "",
+                "address":         str(row.get("Address", "")),
+                "address2":        str(row.get("Landmark", "")),
+                "alt_phone":       str(row.get("Alt Phone", "")),
+                "payment_method":  str(row.get("Payment Method", "")),
                 "city":            str(row.get("City","")).strip(),
                 "state":           str(row.get("State","")).strip(),
                 "pincode":         str(row.get("Pincode","")).strip(),
@@ -517,7 +540,8 @@ def sync_from_sheets():
             log.info("sync_from_sheets: all orders already in local DB")
 
     except Exception as e:
-        log.error(f"sync_from_sheets error: {e}", exc_info=True)
+        log.error("sync_from_sheets failed", exc_info=True)
+        if strict: raise RuntimeError("Order history check failed") from e
 
 def _sync_to_sheets(order):
     try:
@@ -531,13 +555,16 @@ def _sync_to_sheets(order):
         except Exception:
             ws = sh.add_worksheet("Orders", rows=2000, cols=25)
             ws.append_row(SHEET_HEADERS)
+        if ws.col_count < len(SHEET_HEADERS):
+            ws.add_cols(len(SHEET_HEADERS) - ws.col_count)
+        ws.update(range_name="A1", values=[SHEET_HEADERS])
         # Check for duplicate before appending
         col_a     = ws.col_values(1)
         order_num = str(order.get("order_number",""))
         if order_num in col_a:
             # Already exists — update instead
             row_idx = col_a.index(order_num) + 1
-            ws.update(f"A{row_idx}", [_order_to_row(order)])
+            ws.update(range_name=f"A{row_idx}", values=[_order_to_row(order)])
         else:
             ws.append_row(_order_to_row(order))
     except Exception as e:
@@ -555,7 +582,7 @@ def _sync_update(order):
         order_num = str(order.get("order_number",""))
         if order_num in col_a:
             row_idx = col_a.index(order_num) + 1
-            ws.update(f"A{row_idx}", [_order_to_row(order)])
+            ws.update(range_name=f"A{row_idx}", values=[_order_to_row(order)])
         else:
             _sync_to_sheets(order)
     except Exception as e:
@@ -649,7 +676,7 @@ def push_dashboard_to_sheets():
         for d in sorted(day_stats.keys()):
             rows.append([d, day_stats[d]])
 
-        ws.update("A1", rows)
+        ws.update(range_name="A1", values=rows)
 
         # Formatting — bold headers
         try:
