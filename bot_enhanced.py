@@ -771,6 +771,21 @@ def refresh_duplicate_history():
             alternate = next((clean_phone(v) for v in (
                 row.get("customer_alternate_phone"), row.get("alternate_phone"), row.get("alt_phone"),
                 original.get("billing_alternate_phone")) if clean_phone(v)), "")
+            if not primary:
+                detail_response = session.get(f"{SR_BASE}/orders/show/{row_id}", timeout=30)
+                detail_response.raise_for_status()
+                detail = detail_response.json().get("data", {})
+                original_detail = detail.get("others") or {}
+                if not isinstance(original_detail, dict): original_detail = {}
+                primary = next((clean_phone(v) for v in (
+                    detail.get("customer_phone"), detail.get("billing_phone"), detail.get("shipping_phone"),
+                    original_detail.get("billing_phone_number"), original_detail.get("billing_phone")) if clean_phone(v)), "")
+                alternate = alternate or next((clean_phone(v) for v in (
+                    detail.get("customer_alternate_phone"), detail.get("billing_alternate_phone"),
+                    original_detail.get("billing_alternate_phone")) if clean_phone(v)), "")
+                if not primary:
+                    log.warning("Order history contacts unavailable from list and official detail endpoint; remote_order_count=%s", len(_sr_history) + len(pending))
+                    raise RuntimeError("Shiprocket does not expose customer contacts; a complete original order history is required for strict verification")
             pending[row_id] = {
                 "order_number": row.get("channel_order_id") or row_id,
                 "phone": primary, "alt_phone": alternate,
