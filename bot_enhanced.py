@@ -266,7 +266,10 @@ def generate_label(shipment_id):
 def schedule_pickup(shipment_ids):
     try:
         r = sr_post("/courier/generate/pickup", {"shipment_id": shipment_ids})
-        if r.get("pickup_scheduled") or r.get("status") == 1: return True, "✅ Pickup scheduled"
+        if "already in pickup queue" in str(r.get("message", "")).casefold():
+            return True, "✅ Pickup already scheduled"
+        if r.get("pickup_scheduled") in (1, "1", True) or r.get("status") in (1, "1", True):
+            return True, "✅ Pickup scheduled"
         return False, str(r)
     except Exception as e: return False, str(e)
 
