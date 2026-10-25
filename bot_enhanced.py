@@ -750,6 +750,7 @@ def refresh_duplicate_history():
         rows = body.get("data")
         pagination = body.get("meta", {}).get("pagination", {})
         if not isinstance(rows, list) or "total_pages" not in pagination:
+            log.warning("History schema keys=%s data_type=%s meta=%s", list(body), type(rows).__name__, body.get("meta"))
             raise RuntimeError("Cannot verify complete Shiprocket history")
         reached_known = False
         for row in rows:
@@ -1557,8 +1558,8 @@ async def main():
     log.info("Sync done")
     try:
         await asyncio.to_thread(refresh_duplicate_history)
-    except Exception:
-        log.error("Duplicate history unavailable; booking will remain blocked until verification succeeds")
+    except Exception as error:
+        log.error("Duplicate history unavailable; booking blocked: %s", error)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
