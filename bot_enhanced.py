@@ -90,12 +90,25 @@ def refresh_pickups():
     log.info(f"Pickups: {list(_pickups.keys())}")
 
 def resolve_pickup(name):
-    if not name: return next(iter(_pickups.values()), None)
-    key = re.sub(r"\W","",str(name).lower())
-    for k,v in _pickups.items():
-        if key in re.sub(r"\W","",k) or re.sub(r"\W","",k) in key:
-            return v
-    return next(iter(_pickups.values()), None)
+    """Only a unique exact registered name; never select another pickup silently."""
+    key = re.sub(r"\W", "", str(name).casefold())
+    if not key:
+        return None
+    matches = [p for p in _pickups.values()
+               if re.sub(r"\W", "", p["pickup_location"].casefold()) == key]
+    return matches[0] if len(matches) == 1 else None
+
+def extract_pickup(text):
+    """Use the supplied registered pickup even when Gemini misses the field."""
+    labelled = re.findall(r"\b(?:pick[\s_-]*ups?|vendor|supplier)\b\s*[:=-]?\s*([^\n]+)", text, re.I)
+    segments = labelled if labelled else [text]
+    found = set()
+    for p in _pickups.values():
+        name = p["pickup_location"]
+        pattern = r"(?<!\w)" + r"[\s_-]+".join(re.escape(x) for x in re.split(r"[\s_-]+", name.strip())) + r"(?!\w)"
+        if any(re.search(pattern, segment, re.I) for segment in segments):
+            found.add(name)
+    return next(iter(found)) if len(found) == 1 else "MISSING"
 
 def sr_post(ep, payload):
     ensure_token()
@@ -594,14 +607,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await continue_order(update.message, ctx); return
 
     if state == "create_creative":
-        ud["create_creative"] = "" if text.lower() == "skip" else text.upper()
-        ud["state"] = "create_confirm"
-        ud["confirm_nonce"] = uuid.uuid4().hex[:12]
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("Confirm booking", callback_data="book_" + ud["confirm_nonce"]),
-            InlineKeyboardButton("Cancel draft", callback_data="cancel_draft_" + ud["confirm_nonce"]) ]])
-        await update.message.reply_text("Review before booking:\n\n" + order_preview(ud["create_parsed"]), reply_markup=kb)
-        return
+        # Compatibility with a draft opened before this deployment.
+        await continue_order(update.message, ctx); return
 
     if state == "create_confirm":
         await update.message.reply_text("Use Confirm booking or Cancel draft above. Send /start to edit from the beginning."); return
@@ -659,7 +666,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 cid = chosen.get("courier_company_id") or chosen.get("courier_id")
                 awb = assign_awb(shipment_id, cid)
                 if awb and awb != "WALLET_LOW":
-                    await _finish_shipment_after_awb(update, ctx, awb, chosen)
+                    await _finish_shipment_after_awb(update.message, ctx, awb, chosen)
                 else:
                     await update.message.reply_text(
                         f"❌ AWB failed for {chosen.get('courier_name','')}. Try another number:")
@@ -741,20 +748,29 @@ def booking_reference(d):
 def order_preview(d):
     amount = order_amount(d.get("amount", "")) or Decimal(0)
     collect = 0 if d.get("payment_mode") == "PREPAID" else amount
+    pickup = resolve_pickup(d.get("pickup", "")) or {}
+    sender = " ".join(str(pickup.get(k) or "") for k in ("city", "pin_code")).strip()
     return (f"Name: {d.get('name', '')}\nPhone: {d.get('phone', '')}\n"
             f"Address: {d.get('address', '')}\nLandmark: {d.get('address2', 'NA')}\n"
             f"City: {d.get('city', '')}, {d.get('pincode', '')}\nState: {d.get('state', '')}\n"
             f"Product: {d.get('product', '')} | Pickup: {d.get('pickup', '')}\n"
+            f"Pickup city/pincode: {sender}\n"
             f"Payment: {d.get('payment_mode', 'MISSING')}\n"
             f"Order value: ₹{amount:,.2f}\nCollect on delivery: ₹{collect:,.2f}")
 
 async def continue_order(reply, ctx):
     d = ctx.user_data["create_parsed"]
     field, question = missing_order_field(d)
+    pickup = resolve_pickup(d.get("pickup", ""))
+    if field not in ("name", "phone", "address", "city", "state", "pincode") and not pickup:
+        field = "pickup"
+        choices = ", ".join(p["pickup_location"] for p in _pickups.values())
+        question = "Please send the exact pickup location. Registered names: " + (choices or "none; send /start to refresh") + "."
     if field:
         ctx.user_data.update(state="create_missing_field", missing_field=field)
         await reply.reply_text(question + "\nYour other order details are saved. Send /start to cancel.")
         return
+    d["pickup"] = pickup["pickup_location"]
     # Refresh durable history. Never book if the duplicate check cannot be completed.
     try:
         await asyncio.to_thread(sync_from_sheets, strict=True)
@@ -770,13 +786,19 @@ async def continue_order(reply, ctx):
         ctx.user_data.clear()
         return
     d["cod"] = str(order_amount(d["amount"]))
-    ctx.user_data["state"] = "create_creative"
-    await reply.reply_text(order_preview(d) + "\n\nEnter creative code (or type skip). You will review before booking.")
+    ctx.user_data["create_creative"] = ""
+    ctx.user_data["state"] = "create_confirm"
+    ctx.user_data["confirm_nonce"] = uuid.uuid4().hex[:12]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Confirm booking", callback_data="book_" + ctx.user_data["confirm_nonce"]),
+        InlineKeyboardButton("Cancel draft", callback_data="cancel_draft_" + ctx.user_data["confirm_nonce"]) ]])
+    await reply.reply_text("Review before booking:\n\n" + order_preview(d), reply_markup=kb)
 
 async def do_create(update, ctx, text):
     msg = await update.message.reply_text("⏳ Processing with AI...")
     try:
         d = parse_fields(await asyncio.to_thread(ai_parse, text))
+        d["pickup"] = extract_pickup(text)
         supplied = re.sub(r"\W", "", text.casefold())
         extracted_name = re.sub(r"\W", "", d.get("name", "").casefold())
         if not extracted_name or extracted_name not in supplied:
@@ -1033,7 +1055,7 @@ async def _finish_shipment_after_awb(reply, ctx, awb, chosen,
         f"Landmark: {d.get('address2','—')}\n"
         f"City: {d.get('city','')}, {delivery_pin}\n"
         f"State: {d.get('state','Karnataka')}\n"
-        f"Product: {prod_name} | Creative: {creative or '—'}\n"
+        f"Product: {prod_name}\n"
         f"Order value: ₹{cod_amount:,.2f} | Collect on delivery: ₹{0 if sr_payment == 'Prepaid' else cod_amount:,.2f}\n"
         f"Payment: {sr_payment}\n"
         f"Vendor: {pickup_display} | {courier_label}\n"
@@ -1041,6 +1063,7 @@ async def _finish_shipment_after_awb(reply, ctx, awb, chosen,
         f"Tracking: {tracking}",
         parse_mode="Markdown")
 
+    label_sent = False
     label_url = generate_label(shipment_id)
     if label_url:
         try:
@@ -1051,8 +1074,12 @@ async def _finish_shipment_after_awb(reply, ctx, awb, chosen,
                             document=await r2.read(),
                             filename=f"{awb}.pdf",
                             caption=f"📄 {d.get('name','')} | {awb}")
+                        label_sent = True
         except Exception as e:
             log.error(f"Label: {e}")
+
+    if not label_sent:
+        await reply.reply_text(f"Shipment is booked: AWB {awb}. Label download is pending; use Download Labels. Do not create the order again.")
 
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Schedule Pickup", callback_data=f"pickup_yes_{shipment_id}_{order_id}"),
@@ -1492,4 +1519,5 @@ if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
     asyncio.run(main())
+
 
