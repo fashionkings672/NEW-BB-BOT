@@ -1074,7 +1074,10 @@ async def _finish_shipment_after_awb(reply, ctx, awb, chosen,
     collect = 0 if sr_payment == "Prepaid" else cod_amount
     pickup_text = "Pickup scheduled" if pickup_ok else "Pickup pending"
     await reply.reply_text(
-        f"✅ Shipment booked\nProduct: {prod_name}\nCOD: ₹{collect:,.2f}\n{pickup_text}")
+        f"✅ Shipment booked\nProduct: {prod_name}\nOrder value: ₹{cod_amount:,.2f}\n"
+        f"Payment: {sr_payment} | COD: ₹{collect:,.2f}\n"
+        f"Courier: {chosen.get('courier_name') or 'Pending'}\n"
+        f"Tracking: {tracking}\n{pickup_text}")
 
     label_sent = False
     label_url = generate_label(shipment_id)
