@@ -744,7 +744,7 @@ def refresh_duplicate_history():
     while True:
         response = session.get(f"{SR_BASE}/orders", params={
             "page": page, "per_page": 100, "sort_by": "id", "sort": "DESC",
-            "from": "2000-01-01", "to": date.today().isoformat()}, timeout=30)
+            "from": "01-Jan-2000", "to": date.today().strftime("%d-%b-%Y")}, timeout=30)
         response.raise_for_status()
         body = response.json()
         rows = body.get("data")
