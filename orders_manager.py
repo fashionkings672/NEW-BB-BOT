@@ -490,11 +490,8 @@ def sync_from_sheets(strict=False):
             status  = str(row.get("Status","active")).strip()
             label_dl= str(row.get("Label Downloaded","")).strip()
 
-            # Clean phone from sheet
-            raw_phone = re.sub(r"[^\d]","", str(row.get("Phone","") or "").strip())
-            if raw_phone.startswith("91") and len(raw_phone) == 12:
-                raw_phone = raw_phone[2:]
-            clean_phone = raw_phone[-10:] if len(raw_phone) >= 10 else raw_phone
+            # Normalize before removing punctuation, including spreadsheet float suffixes.
+            clean_phone = _norm_phone(row.get("Phone", ""))
 
             order = {
                 "order_id":        str(row.get("Bot Order ID", "") or f"SHEET_{num}"),
